@@ -24,7 +24,7 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 
 # ---------------------------------------------------------------------------
 # Config (module-head constants; no config-file parsing)
@@ -72,6 +72,73 @@ PEAK_MARK_RGBA = (0.933, 0.941, 0.961, 1.0)
 MIC_RECORDING_RGB = (0.90, 0.27, 0.29)
 MIC_TRANSCRIBING_RGB = (0.91, 0.66, 0.31)
 HOT_LEVEL = 0.85
+
+# Theme integration: colours come from the active GTK theme (re-read on every
+# show); the RGBA constants above are only the fallback. The mic glyph is the
+# icon theme's own symbolic microphone, with a bundled copy as a fallback.
+MIC_ICON_NAME = "audio-input-microphone-symbolic"
+MIC_ICON_FALLBACK = Path(__file__).resolve().parent / "icons" / (MIC_ICON_NAME + ".svg")
+GLYPH_ICON_PX = 28
+
+
+# The panel tints the tray's error/warning symbolic icons with Cinnamon's
+# shell-theme colours, which fall back to these St defaults when the theme
+# (e.g. Mint-Y) does not set any. Use the same values so the OSD matches the tray.
+PANEL_ERROR_RGBA = (0.80, 0.0, 0.0, 1.0)
+PANEL_WARNING_RGBA = (0.961, 0.475, 0.243, 1.0)
+
+
+def _lookup(ctx: Gtk.StyleContext, names, fallback, alpha=None):
+    for name in names:
+        ok, c = ctx.lookup_color(name)
+        if ok:
+            return (c.red, c.green, c.blue, c.alpha if alpha is None else alpha)
+    return fallback if alpha is None else (*fallback[:3], alpha)
+
+
+def _theme_colors() -> dict:
+    ctx = Gtk.Window().get_style_context()
+    fg = _lookup(ctx, ["theme_fg_color", "fg_color"], (0.93, 0.94, 0.96, 1.0), 1.0)
+    bg = _lookup(ctx, ["theme_bg_color", "bg_color"], CARD_OPAQUE_RGBA, 1.0)
+    accent = _lookup(ctx, ["theme_selected_bg_color", "selected_bg_color"], WAVE_RGBA, 1.0)
+    warn = PANEL_WARNING_RGBA
+    err = PANEL_ERROR_RGBA
+    return {
+        "card": (*bg[:3], 0.95),
+        "card_opaque": bg,
+        "border": (*fg[:3], 0.18),
+        "fg": fg,
+        "wave": accent,
+        "wave_hot": warn,
+        "wave_idle": (*fg[:3], 0.25),
+        "meter_track": (*fg[:3], 0.15),
+        "meter_green": accent,
+        "meter_yellow": warn,
+        "meter_red": err,
+        "peak": fg,
+        "mic_recording": err,
+        "mic_transcribing": warn,
+    }
+
+
+def _load_mic_pixbuf(px: int):
+    path = None
+    try:
+        info = Gtk.IconTheme.get_default().lookup_icon(
+            MIC_ICON_NAME, px, Gtk.IconLookupFlags.FORCE_SIZE
+        )
+        if info is not None:
+            path = info.get_filename()
+    except Exception:
+        path = None
+    for candidate in (path, os.fspath(MIC_ICON_FALLBACK)):
+        if candidate:
+            try:
+                return GdkPixbuf.Pixbuf.new_from_file_at_size(candidate, px, px)
+            except Exception:
+                continue
+    return None
+
 
 AUDIO_SOCK = (
     Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
@@ -168,6 +235,18 @@ class Overlay:
         self._last_tick: float | None = None
         self._last_connect_at = 0.0
         self._composited = True
+        self._colors = _theme_colors()
+        self._mic_surface = None
+
+    def _refresh_theme(self) -> None:
+        self._colors = _theme_colors()
+        scale = self._window.get_scale_factor() if self._window is not None else 1
+        pixbuf = _load_mic_pixbuf(GLYPH_ICON_PX * scale)
+        self._mic_surface = (
+            Gdk.cairo_surface_create_from_pixbuf(pixbuf, scale, None)
+            if pixbuf is not None
+            else None
+        )
 
     def set_state(self, state: str | None) -> None:
         if self._disabled:
@@ -201,6 +280,7 @@ class Overlay:
             self._build_window()
         assert self._window is not None
         self._place()
+        self._refresh_theme()
         self._history.clear()
         self._pending.clear()
         self._meter = 0.0
@@ -462,24 +542,30 @@ class Overlay:
         cr.paint()
         cr.set_operator(cairo.OPERATOR_OVER)
 
-        card = CARD_RGBA if self._composited else CARD_OPAQUE_RGBA
-        if self._composited:
-            _rounded_rect(cr, 0.0, 0.0, float(CARD_W), float(CARD_H), float(CARD_RADIUS))
-            cr.set_source_rgba(*card)
-            cr.fill()
-        else:
-            cr.set_source_rgba(*card)
-            cr.rectangle(0.0, 0.0, float(CARD_W), float(CARD_H))
-            cr.fill()
+        c = self._colors
+        card = c["card"] if self._composited else c["card_opaque"]
+        radius = float(CARD_RADIUS) if self._composited else 0.0
+        _rounded_rect(cr, 0.0, 0.0, float(CARD_W), float(CARD_H), radius)
+        cr.set_source_rgba(*card)
+        cr.fill()
+        _rounded_rect(cr, 0.5, 0.5, CARD_W - 1.0, CARD_H - 1.0, max(0.0, radius - 0.5))
+        cr.set_source_rgba(*c["border"])
+        cr.set_line_width(1.0)
+        cr.stroke()
 
-        tint = (
-            MIC_TRANSCRIBING_RGB
-            if self._state == "transcribing"
-            else MIC_RECORDING_RGB
-        )
-        _draw_mic(cr, GLYPH_X, GLYPH_Y, float(GLYPH_W), float(GLYPH_H), tint)
-        _draw_waveform(cr, self._history)
-        _draw_meter(cr, self._meter, self._peak_hold)
+        tint = c["mic_transcribing"] if self._state == "transcribing" else c["mic_recording"]
+        if self._mic_surface is not None:
+            size = float(GLYPH_ICON_PX)
+            cr.set_source_rgba(*tint)
+            cr.mask_surface(
+                self._mic_surface,
+                GLYPH_X + (GLYPH_W - size) / 2.0,
+                (CARD_H - size) / 2.0,
+            )
+        else:
+            _draw_mic(cr, GLYPH_X, GLYPH_Y, float(GLYPH_W), float(GLYPH_H), tint[:3])
+        _draw_waveform(cr, self._history, c)
+        _draw_meter(cr, self._meter, self._peak_hold, c)
 
 
 def _draw_mic(
@@ -516,7 +602,7 @@ def _draw_mic(
     cr.stroke()
 
 
-def _draw_waveform(cr: cairo.Context, history: deque[float]) -> None:
+def _draw_waveform(cr: cairo.Context, history: deque[float], c: dict) -> None:
     wave_h = float(WAVE_BOTTOM - WAVE_TOP)
     if wave_h <= 0 or WAVE_CAPACITY <= 0:
         return
@@ -532,17 +618,17 @@ def _draw_waveform(cr: cairo.Context, history: deque[float]) -> None:
         bar_h = max(1.0, round(norm * wave_h))
         top = mid - bar_h / 2.0
         if not math.isfinite(norm) or norm <= 0.0:
-            color = WAVE_IDLE_RGBA
+            color = c["wave_idle"]
         elif norm >= HOT_LEVEL:
-            color = WAVE_HOT_RGBA
+            color = c["wave_hot"]
         else:
-            color = WAVE_RGBA
+            color = c["wave"]
         cr.set_source_rgba(*color)
         cr.rectangle(float(left), float(top), float(BAR_W), float(bar_h))
         cr.fill()
 
 
-def _draw_meter(cr: cairo.Context, level: float, peak: float) -> None:
+def _draw_meter(cr: cairo.Context, level: float, peak: float, c: dict) -> None:
     x = float(CONTENT_LEFT)
     y = float(METER_TOP)
     w = float(CONTENT_RIGHT - CONTENT_LEFT)
@@ -551,7 +637,7 @@ def _draw_meter(cr: cairo.Context, level: float, peak: float) -> None:
         return
     radius = h / 2.0
     _rounded_rect(cr, x, y, w, h, radius)
-    cr.set_source_rgba(*METER_TRACK_RGBA)
+    cr.set_source_rgba(*c["meter_track"])
     cr.fill()
 
     level = max(0.0, min(1.0, level if math.isfinite(level) else 0.0))
@@ -564,13 +650,13 @@ def _draw_meter(cr: cairo.Context, level: float, peak: float) -> None:
         cr.clip()
         yellow_x = x + w * _db_to_norm(ZONE_YELLOW_DB)
         red_x = x + w * _db_to_norm(ZONE_RED_DB)
-        cr.set_source_rgba(*METER_GREEN_RGBA)
+        cr.set_source_rgba(*c["meter_green"])
         cr.rectangle(x, y, yellow_x - x, h)
         cr.fill()
-        cr.set_source_rgba(*METER_YELLOW_RGBA)
+        cr.set_source_rgba(*c["meter_yellow"])
         cr.rectangle(yellow_x, y, max(0.0, red_x - yellow_x), h)
         cr.fill()
-        cr.set_source_rgba(*METER_RED_RGBA)
+        cr.set_source_rgba(*c["meter_red"])
         cr.rectangle(red_x, y, max(0.0, x + w - red_x), h)
         cr.fill()
         cr.restore()
@@ -580,7 +666,7 @@ def _draw_meter(cr: cairo.Context, level: float, peak: float) -> None:
         mark_w = float(PEAK_MARK_W)
         px = x + w * peak
         left = min(max(px - mark_w / 2.0, x), x + w - mark_w)
-        cr.set_source_rgba(*PEAK_MARK_RGBA)
+        cr.set_source_rgba(*c["peak"])
         cr.rectangle(left, y, mark_w, h)
         cr.fill()
 

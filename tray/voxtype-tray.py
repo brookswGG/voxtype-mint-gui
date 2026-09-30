@@ -4,17 +4,18 @@
 Watches the Voxtype daemon's state file
 ($XDG_RUNTIME_DIR/voxtype/state) and shows the state as a microphone icon:
 
-  idle           - grey microphone
-  recording      - white microphone on a green circle
-  transcribing   - white microphone on a yellow circle
-  (file missing) - grey microphone, tooltip points out the inactive daemon
+  idle           - the theme's microphone
+  recording      - the same microphone tinted with the theme's error colour
+  transcribing   - the same microphone tinted with the theme's warning colour
+  (file missing) - idle icon, tooltip points out the inactive daemon
 
-Left-click toggles recording (voxtype record toggle).
+Left-click toggles recording (voxtype record toggle). While recording or
+transcribing, overlay.py shows an on-screen level meter.
 """
 import os
+import shutil
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 import gi
@@ -34,30 +35,41 @@ STATE_FILE = Path(
     os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 ) / "voxtype" / "state"
 
+# Idle uses the theme's own symbolic microphone so it matches the other panel
+# icons in size and colour. The active states are symbolic copies of it with
+# the error/warning class set, so the panel sizes them identically and tints
+# them with the theme's colours. Symbolic icons only get that treatment when
+# resolved by name, so they are installed into the user's icon theme.
 ICONS = {
-    "idle": ICON_DIR / "mic-idle.png",
-    "recording": ICON_DIR / "mic-recording.png",
-    "transcribing": ICON_DIR / "mic-transcribing.png",
+    "idle": "audio-input-microphone-symbolic",
+    "recording": "voxtype-recording-symbolic",
+    "transcribing": "voxtype-transcribing-symbolic",
 }
+USER_ICON_DIR = Path.home() / ".local/share/icons/hicolor/symbolic/apps"
+
+
+def install_icons():
+    USER_ICON_DIR.mkdir(parents=True, exist_ok=True)
+    changed = False
+    for state, name in (("recording", "mic-recording"), ("transcribing", "mic-transcribing")):
+        src = ICON_DIR / f"{name}-symbolic.svg"
+        dst = USER_ICON_DIR / f"{ICONS[state]}.svg"
+        if not dst.exists() or dst.read_bytes() != src.read_bytes():
+            shutil.copyfile(src, dst)
+            changed = True
+    if changed:
+        # Nudge icon-theme watchers so a running panel picks the files up.
+        os.utime(USER_ICON_DIR.parents[2])
+        subprocess.run(["gtk-update-icon-cache", "-f", "-t", str(USER_ICON_DIR.parents[2])],
+                       capture_output=True)
+
+
 TOOLTIPS = {
     "idle": "Voxtype ready — hold the hotkey to dictate, click to toggle",
     "recording": "Voxtype: recording …",
     "transcribing": "Voxtype: transcribing …",
 }
 TOOLTIP_OFF = "Voxtype daemon not running (systemctl --user start voxtype)"
-
-# Switching the backend swaps a symlink under /usr/lib/voxtype -> sudo.
-# Autostarted processes lack SUDO_ASKPASS (it is only exported in .bashrc),
-# so set it explicitly to let sudo -A use the graphical askpass helper.
-ASKPASS = Path.home() / ".local/bin/sudo-askpass"
-
-
-def sudo_env():
-    env = os.environ.copy()
-    if "SUDO_ASKPASS" not in env and ASKPASS.exists():
-        env["SUDO_ASKPASS"] = str(ASKPASS)
-    return env
-
 
 class VoxtypeTray:
     def __init__(self):
@@ -93,87 +105,12 @@ class VoxtypeTray:
             item.connect("activate", cb)
             menu.append(item)
 
-        self._gpu_guard = False
-        self.gpu_item = Gtk.CheckMenuItem(label="GPU acceleration (CUDA)")
-        self.gpu_item.connect("toggled", self.on_gpu_toggled)
-        # Voxtype's prebuilt ONNX CUDA binaries require AVX-512 — without it
-        # --enable always fails, so grey the item out right away.
-        if not self._cpu_has_avx512():
-            self.gpu_item.set_label("GPU acceleration (requires AVX-512 CPU)")
-            self.gpu_item.set_sensitive(False)
-        menu.append(self.gpu_item)
-
         quit_item = Gtk.MenuItem(label="Quit tray")
         quit_item.connect("activate", lambda *_: Gtk.main_quit())
         menu.append(quit_item)
 
         menu.show_all()
-        threading.Thread(target=self._sync_gpu_state, daemon=True).start()
         return menu
-
-    # --- GPU backend switching -------------------------------------------
-
-    @staticmethod
-    def _cpu_has_avx512() -> bool:
-        try:
-            return "avx512" in Path("/proc/cpuinfo").read_text()
-        except OSError:
-            return False
-
-    def query_gpu_active(self):
-        """True/False = active backend is GPU/CPU, None = not determinable."""
-        try:
-            out = subprocess.run(
-                ["voxtype", "setup", "gpu", "--status"],
-                capture_output=True, text=True, timeout=15,
-            ).stdout
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        for line in out.splitlines():
-            if line.startswith("Active backend:"):
-                return "GPU" in line
-        return None
-
-    def _sync_gpu_state(self):
-        active = self.query_gpu_active()
-        if active is not None:
-            GLib.idle_add(self._set_gpu_check, active)
-
-    def _set_gpu_check(self, active: bool) -> bool:
-        self._gpu_guard = True
-        self.gpu_item.set_active(active)
-        self._gpu_guard = False
-        return False  # do not repeat the idle_add
-
-    def on_gpu_toggled(self, item):
-        if self._gpu_guard:
-            return
-        threading.Thread(
-            target=self._switch_gpu, args=(item.get_active(),), daemon=True
-        ).start()
-
-    def _switch_gpu(self, enable: bool):
-        flag = "--enable" if enable else "--disable"
-        try:
-            result = subprocess.run(
-                ["sudo", "-A", "voxtype", "setup", "gpu", flag],
-                env=sudo_env(), capture_output=True, text=True, timeout=180,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            result = None
-            print(f"GPU switch failed: {exc}", file=sys.stderr)
-        if result is not None and result.returncode == 0:
-            subprocess.run(
-                ["systemctl", "--user", "restart", "voxtype"],
-                capture_output=True, timeout=60,
-            )
-        else:
-            # Cancelled (e.g. askpass dialog closed) or failed — only bother
-            # the user on a real error; the checkbox is resynced below.
-            if result is not None and result.stderr.strip():
-                self.run_bg(["notify-send", "-u", "critical", "Voxtype",
-                             f"GPU switch failed:\n{result.stderr.strip()[:200]}"])
-        self._sync_gpu_state()
 
     # --- State handling ---------------------------------------------------
 
@@ -225,6 +162,10 @@ class VoxtypeTray:
 
 
 def main():
+    try:
+        install_icons()
+    except OSError as exc:
+        print(f"could not install state icons: {exc}", file=sys.stderr)
     VoxtypeTray()
     Gtk.main()
 

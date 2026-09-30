@@ -1,3 +1,0 @@
-# Voxtype: grant the active seat user access to input devices (evdev hotkey)
-# uaccess tag => systemd-logind sets an ACL for the logged-in user
-SUBSYSTEM=="input", KERNEL=="event*", TAG+="uaccess"
