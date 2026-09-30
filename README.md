@@ -8,6 +8,12 @@ Both follow the active theme: the tray uses the icon theme's microphone (same
 size and style as the other panel icons) and the overlay takes its card and
 accent colours from the GTK theme.
 
+![Overlay while recording and transcribing](docs/overlay.png)
+
+![Tray icon: idle, recording, transcribing](docs/tray.png)
+
+*The overlay in the screenshot was driven by simulated audio levels; the tray states are from a real recording.*
+
 ## What you get
 
 - **Tray icon** (`XApp.StatusIcon`): microphone = ready, red = recording,
